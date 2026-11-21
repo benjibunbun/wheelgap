@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- GitHub annotations keep the correct file and line for requirements included with `-r` inside a constraints file (`-c`), including nested constraints. Constraint-only entries are not annotated.
+- `--github-annotations` keeps the file and line of every package when a requirements file is included with `-r` inside a constraints file (`-c`), also through nested constraints files; before, every annotation of such an input landed on the top file with no line. (#619, thanks [@benjibunbun](https://github.com/benjibunbun))
 - Requirements files: an include cycle (two files that include each other, or a file that includes itself, with `-r` or `-c`) is now an input error naming the chain, as pip refuses it, instead of being read once and reported as a clean result. (#616, thanks [@Dikshant-Neupane](https://github.com/Dikshant-Neupane))
 - The MCP server's tools keep the notes that explain an empty `gap_wheels` even when the project sets `quiet = true`, so a client can still tell "no wheel fills these gaps" from "wasn't checked" or "--fix is off with another index". (#617, thanks [@Dikshant-Neupane](https://github.com/Dikshant-Neupane))
 - `--github-annotations --fix` puts the full stop before the pip command instead of after it, so copying the command from an annotation no longer gives pip a version ending in a full stop. (#615, thanks [@Dikshant-Neupane](https://github.com/Dikshant-Neupane))
