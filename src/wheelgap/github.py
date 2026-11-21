@@ -16,6 +16,7 @@ import re
 import shlex
 import tomllib
 from bisect import bisect_right
+from collections.abc import Mapping
 from pathlib import Path
 
 from packaging.utils import canonicalize_name
@@ -175,19 +176,24 @@ _NAME_START_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[Package, Path, int | None]] | None:
-    """Each requirement reached through -r/-c, as the parser reads it: the package, file and the line its name is
-    on (None if that isn't clear). A constraints file's own lines aren't requirements. None if a file can't be
-    read the same way."""
+    """Each requirement reached through -r/-c, as the parser reads it: the package, the file and the line its name
+    is on (None if that isn't clear). A constraints file's own lines aren't requirements. None if a file can't be
+    read the same way. A file is read through the folder it was named in, as the parser reads it, so an annotation
+    is on the file pip reads; `seen` keeps the resolved path, so a file reached by two names is scanned once (if
+    the parser then finds other includes under the second name, the lists differ and Locator uses no lines)."""
     return _requirement_lines(path, {False: set() if seen is None else seen, True: set()})
 
 
 def _requirement_lines(
     path: Path, seen: dict[bool, set[Path]], constraint: bool = False
 ) -> list[tuple[Package, Path, int | None]] | None:
-    path = path.resolve()
-    if path in seen[constraint]:
+    """`seen` is the parser's: the resolved paths already read as requirements (False) and as constraints (True),
+    since a file can be read once in each role."""
+    path = Path(os.path.abspath(path))
+    resolved = path.resolve()
+    if resolved in seen[constraint]:
         return []
-    seen[constraint].add(path)
+    seen[constraint].add(resolved)
     lines = _lines(path)
     if lines is None or any(_OTHER_BREAKS.search(line) for line in lines):
         return None
@@ -326,7 +332,7 @@ class Locator:
 def relative_path(path: Path, root_env: str = "GITHUB_WORKSPACE") -> str | None:
     """The path GitHub expects: relative to the repository (the `root_env` variable, GITHUB_WORKSPACE by default,
     else the current directory), with forward slashes. None for a file outside it, which GitHub couldn't show in the
-    diff."""
+    diff. Links are resolved: git keeps a link as a link, so only the file it points to has lines to show."""
     base = os.environ.get(root_env) or os.getcwd()
     try:
         return path.resolve().relative_to(Path(base).resolve()).as_posix()
@@ -359,6 +365,8 @@ def annotation(
     locator: Locator,
     advisory: frozenset[Target] = frozenset(),
     fills: list[gapwheels.Fill] | None = None,
+    *,
+    installed_by: str | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     by_status: dict[Status, list[str]] = {}
@@ -385,6 +393,8 @@ def annotation(
     message = f"{name} {'; '.join(parts)}"
     if names:
         message += f" (via {', '.join(names)}{'' if not any(rooted) else ' on some targets'})"
+    if installed_by is not None:
+        message += f" (installed by {installed_by})"
     message += "."
     if pkg.error:
         message += f" Lookup error: {pkg.error}."
@@ -422,6 +432,8 @@ def github_annotations(
     failing: list[Row],
     advisory: frozenset[Target] = frozenset(),
     fills: list[gapwheels.Fill] | None = None,
+    *,
+    installed_by: Mapping[int, str] | None = None,
 ) -> list[str]:
     """One ::error per failing package and one ::warning per package whose gaps don't fail the run (source builds
     that --fail-on missing allows, or gaps only on --advisory targets), at most ANNOTATION_LIMIT of each: past that,
@@ -436,7 +448,18 @@ def github_annotations(
     for level in ("error", "warning"):
         chosen = [r for r in rows if not r.ok and (id(r) in failing_ids) == (level == "error")]
         shown = chosen if len(chosen) <= ANNOTATION_LIMIT else chosen[: ANNOTATION_LIMIT - 1]
-        out += [annotation(r, targets, level, locator, advisory, filled.get(id(r))) for r in shown]
+        out += [
+            annotation(
+                r,
+                targets,
+                level,
+                locator,
+                advisory,
+                filled.get(id(r)),
+                installed_by=installed_by.get(id(r.package)) if installed_by is not None else None,
+            )
+            for r in shown
+        ]
         if more := len(chosen) - len(shown):
             what = f"{more} more packages with gaps"  # never 1: a single extra would fit in the limit
             out.append(workflow_command(level, f"{what}; the log lists them all.", title=f"wheelgap: {what}"))

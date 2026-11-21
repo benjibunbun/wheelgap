@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import platform
@@ -332,7 +333,7 @@ def make_parser() -> argparse.ArgumentParser:
         "--fix",
         action="store_true",
         help="also say which gaps a wheel on wheelgap's gap wheel index fills, and how to install from it (reads "
-        "the index's list from wheelgap.github.io, which sends no package names, and keeps it in the 24-hour cache; "
+        "the index's list from wheelgap.github.io, which sends no package names, and keeps it in the 1-hour cache; "
         "not with --offline, and off with --index-url or a WHEELGAP_INDEX_URL mirror)",
     )
     p.add_argument(
@@ -837,7 +838,7 @@ def render_explain(
     """`conda_forge`: --conda-forge hints, `piwheels`: --piwheels hints, `build_info`: --build-info answers and
     `suggestions`: --suggest's, by id() of the row's package. `notes` and `builds` (the tracker's build lab results):
     --notes, by id() of the row. `published_wheels`: --fix's fills (from the gap wheel list, which may come from the
-    24-hour cache), shown once per release under its first filled target."""
+    1-hour cache), shown once per release under its first filled target."""
     multi_py = len({t.python for t in targets}) > 1
     filled: dict[int, list[gapwheels.Fill]] = {}
     for fill in published_wheels or []:
@@ -999,6 +1000,7 @@ def report_json(
     issues_urls: dict[int, str | None] | None = None,
     gap_wheels: list[gapwheels.Fill] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
+    dockerfile_inputs: list[dict[str, str | int]] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
     gaps = [r for r in rows if not r.ok]
@@ -1108,6 +1110,8 @@ def report_json(
         report["blocking_newer_python"] = blocking.names
     if gap_wheels is not None:  # --fix: one entry per gap cell a wheel on the gap wheel index fills
         report["gap_wheels"] = gapwheels.to_json(gap_wheels, multi_py)
+    if dockerfile_inputs is not None:
+        report["dockerfile_inputs"] = dockerfile_inputs
     return json.dumps(report, indent=2)
 
 
@@ -1300,7 +1304,7 @@ def render_markdown(
     dropped: dict[str, str] | None = None,
     issues_urls: dict[int, str | None] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
-    fix_hint: bool = False,
+    fix_hint: str | None = None,
 ) -> list[str]:
     """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
     plain = Style(False)
@@ -1397,7 +1401,7 @@ def render_markdown(
             if sug_lines:
                 out += [*sug_lines, ""]
     if fix_hint:
-        out += [FIX_HINT, ""]
+        out += [fix_hint, ""]
     return out
 
 
@@ -1676,7 +1680,9 @@ def gap_wheel_fills(
 ) -> list[gapwheels.Fill]:
     """--fix: the gap cells a wheel on wheelgap's gap wheel index fills. The list is read in one request that names no
     package, only when a gap of a package that is positively PyPI's could use it (gapwheels.eligible), and never when
-    packages come from another index. Notes on stderr say when it wasn't read, couldn't be, or nothing fits."""
+    packages come from another index. A cached list (cache.GAP_WHEELS_MAX_AGE) answers only when it fills at least one
+    of this run's gaps: before saying none fits, the list is fetched once more, since new wheels are published most
+    days. Notes on stderr say when it wasn't read, couldn't be (or couldn't be refreshed), or nothing fits."""
     other = origin.other_index(index_url)
     if other is not None:
         if not quiet:
@@ -1704,12 +1710,30 @@ def gap_wheel_fills(
         )
     fills: list[gapwheels.Fill] = []
     if wanted:
-        wheels = gapwheels.look_up(read_cache=read_cache, write_cache=write_cache)
-        if wheels is None:
+        cached_wheels: list[gapwheels.GapWheel] | None = None
+        saved_time: float | None = None
+        if read_cache:
+            cached_wheels, saved_time = gapwheels.look_up_cached()
+            if cached_wheels is not None:
+                fills = gapwheels.fillable(wanted, targets, source_of, cached_wheels, private, index_url)
+                if fills:
+                    return fills
+        live_wheels = gapwheels.fetch(write_cache=write_cache)
+        if live_wheels is None:
+            if cached_wheels is not None and saved_time is not None:
+                # Even with -q, like the note below: the index may have a wheel this older list lacks, and without
+                # the note a run that couldn't ask it would read as "no gap wheel fits".
+                time_str = datetime.datetime.fromtimestamp(saved_time, datetime.UTC).strftime("%H:%M UTC")
+                print(
+                    f"wheelgap: note: --fix: no wheel on the gap wheel list fetched at {time_str} "
+                    "fills these gaps; the list couldn't be refreshed",
+                    file=sys.stderr,
+                )
+                return []
             # Even with -q: without it, a run that couldn't look would read as "no gap wheel fits".
             print("wheelgap: note: couldn't read the gap wheel list, so --fix has no suggestions", file=sys.stderr)
             return []
-        fills = gapwheels.fillable(wanted, targets, source_of, wheels, private, index_url)
+        fills = gapwheels.fillable(wanted, targets, source_of, live_wheels, private, index_url)
         if not fills and not quiet:
             print("wheelgap: note: --fix: no wheel on the gap wheel index fills these gaps", file=sys.stderr)
     return fills
@@ -1894,10 +1918,21 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         config_inputs = [str(context_dir)]
     else:
         config_inputs = args.inputs
+    docker_includes: dict[tuple[int, Path], tuple[Path, ...]] = {}
+    docker_constraints: dict[Path, tuple[Path, ...]] = {}
+    uv_installs: set[tuple[int, Path]] = set()
     try:
         if args.dockerfile_inputs:
             context = Path(args.dockerfile_context) if args.dockerfile_context else None
-            installs = dockerfile_requirements(Path(args.dockerfile), build_args, context=context)
+            installs = dockerfile_requirements(
+                Path(args.dockerfile),
+                build_args,
+                context=context,
+                includes=docker_includes,
+                constraints=docker_constraints,
+                dependencies=args.deps,
+                uv_installs=uv_installs,
+            )
             args.inputs = [str(requirements) for _, requirements in installs]
         if args.clear_cache:
             folder, count = cache.clear()
@@ -1927,8 +1962,18 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             image = read_dockerfile(Path(args.dockerfile), build_args)
             if not quiet:
                 for install_line, requirements in installs:
+                    # Every file read: the requirements file and what it includes, then each -c file of the line
+                    # and what that includes (a -r in a constraints file is requirements, a -c more constraints).
+                    files = ", ".join(
+                        str(file) for file in (requirements, *docker_includes[install_line, requirements])
+                    )
+                    for constraint in docker_constraints.get(requirements, ()):
+                        files += f", -c {constraint}"
+                        if nested := docker_includes[install_line, constraint]:
+                            files += f" (which includes {', '.join(str(file) for file in nested)})"
+                    installer = "uv pip" if (install_line, requirements) in uv_installs else "pip"
                     print(
-                        f"wheelgap: note: {args.dockerfile}:{install_line}: RUN pip install -r reads {requirements}",
+                        f"wheelgap: note: {args.dockerfile}:{install_line}: RUN {installer} install -r reads {files}",
                         file=sys.stderr,
                     )
                 for name, value in image.build_args:
@@ -2025,7 +2070,9 @@ def _main(argv: list[str], project: Path | None = None) -> int:
             sources = [log_source(failures)]
         else:
             sources = (
-                [parse_dist(Path(args.dist))] if args.dist else load_inputs(args.inputs or ["."], args.environment)
+                [parse_dist(Path(args.dist))]
+                if args.dist
+                else load_inputs(args.inputs or ["."], args.environment, requirements_constraints=docker_constraints)
             )
         if args.print_gap_wheel_snippet and (
             len(sources) != 1
@@ -2354,6 +2401,14 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         for source, needed in zip(sources, needed_by_source, strict=True):
             if source.uv_packages is not None:
                 restore_uv_python_files(needed, pythons)
+    # --dockerfile-inputs: a requirements file that `RUN uv pip install` installs follows uv's rules, not pip's, as
+    # a uv.lock checked with --online does just above: uv checks only the lower bound of a file's Requires-Python,
+    # so it installs a pin pip refuses (uv 0.13.1 installs sktime==0.20.0, Requires-Python <3.12,>=3.8, on Python
+    # 3.13; pip finds no matching distribution). Every requirement in such a file is pinned (dockerfile_requirements).
+    uv_files = {requirements for line, requirements in installs if (line, requirements) in uv_installs}
+    for source, needed in zip(sources, needed_by_source, strict=True):
+        if source.path in uv_files:
+            restore_uv_python_files(needed, pythons)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:
@@ -2402,7 +2457,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         what, it = ("package is", "it") if pip_refusals == 1 else ("packages are", "them")
         print(
             f"wheelgap: note: {pip_refusals} {what} checked as uv installs {it}, though pip would refuse {it}: "
-            "uv ignores Requires-Python upper bounds (the text report's --explain says which, and --json lists "
+            "uv checks the Requires-Python lower bound (the text report's --explain says which, and --json lists "
             "the files in pip_refuses)",
             file=sys.stderr,
         )
@@ -2418,6 +2473,11 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     file=sys.stderr,
                 )
     source_labels = [s.label for s in sources]
+    install_sites = {path: f"{args.dockerfile}:{line}" for line, path in installs}
+    display_labels = [
+        f"{source.label} ({install_sites[source.path]})" if source.path in install_sites else source.label
+        for source in sources
+    ]
     row_notes: RowNotes = {}
     row_builds: RowBuilds = {}
     # Opt-in, since it sends package names to wheelgap.github.io: --explain on a lockfile makes no requests by default.
@@ -2549,14 +2609,18 @@ def _main(argv: list[str], project: Path | None = None) -> int:
         if args.fix
         else None
     )
-    fix_hint = (
-        not args.fix
-        and not args.json
-        and not quiet
-        and not offline
-        and origin.other_index(index_url) is None
-        and bool(gap_wheel_candidates(gaps, targets, sources, index_url)[1])
-    )
+    # The hint never makes a request: it reads only the list a --fix run left in the cache (kept for
+    # cache.GAP_WHEELS_MAX_AGE), and only when a gap could use it. No hint when that list fills nothing; that is
+    # silence, not "nothing fits": --fix itself fetches the list again before it says so (gap_wheel_fills).
+    fix_hint = None
+    if not (args.fix or args.json or quiet or offline) and origin.other_index(index_url) is None:
+        _, hint_rows, source_of, private = gap_wheel_candidates(gaps, targets, sources, index_url)
+        if hint_rows:
+            wheels = gapwheels.look_up_cached()[0] if cached["read_cache"] else None
+            if wheels is None:
+                fix_hint = FIX_HINT
+            elif count := len(gapwheels.fillable(hint_rows, targets, source_of, wheels, private, index_url)):
+                fix_hint = f"Run with --fix: wheelgap's gap wheel index has a wheel for {count} of these gaps."
 
     if args.print_gap_wheel_snippet:  # one input of gapwheels.SNIPPET_KINDS, checked when it was read
         multi_py = len({t.python for t in targets}) > 1
@@ -2611,7 +2675,16 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     if args.github_annotations:
         # Workflow commands work on stdout and stderr alike; stderr keeps --json and --markdown output clean.
         # These are wheelgap's own (escaped in github.workflow_command), so they go past the logsafe guard.
-        for command in github_annotations(rows, targets, sources, failing, advisory, fills):
+        installed_by = (
+            {
+                package_id: install_sites[source.path]
+                for package_id, source in source_of.items()
+                if source.path is not None and source.path in install_sites
+            }
+            if install_sites
+            else None
+        )
+        for command in github_annotations(rows, targets, sources, failing, advisory, fills, installed_by=installed_by):
             write_command(command, sys.stderr if args.json or args.markdown else sys.stdout)
 
     if args.json:
@@ -2634,6 +2707,14 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 issues_urls=issues_urls,
                 gap_wheels=fills,
                 pi_wheels=pi_wheels,
+                # As the Dockerfile's COPY names it: relative to the build context, with /, whatever the OS, the
+                # working directory or the way the context was given.
+                dockerfile_inputs=[
+                    {"dockerfile": args.dockerfile, "line": line, "file": path.relative_to(context_dir).as_posix()}
+                    for line, path in installs
+                ]
+                if args.dockerfile_inputs
+                else None,
             )
         )
         return code
@@ -2646,7 +2727,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                     *render_markdown(
                         rows,
                         targets,
-                        source_labels,
+                        display_labels,
                         skipped,
                         ignored,
                         args,
@@ -2702,7 +2783,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
 
     pys = ", ".join(dict.fromkeys(t.python for t in targets))
     n_pkgs = f"{total_pkgs} package{'s' * (total_pkgs != 1)}"
-    print(style.dim(f"wheelgap {__version__} · {' + '.join(source_labels)} · {n_pkgs} · Python {pys}"))
+    print(style.dim(f"wheelgap {__version__} · {' + '.join(display_labels)} · {n_pkgs} · Python {pys}"))
     print()
 
     shown = rows if args.all else gaps
@@ -2760,7 +2841,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 for why in dict.fromkeys(r.package.pip_refuses.values()):
                     print(
                         f"{r.package.name} {r.package.version} on {affected}: checked as uv installs it "
-                        f"(uv ignores Requires-Python upper bounds); pip refuses it: {why}"
+                        f"(uv checks the Requires-Python lower bound); pip refuses it: {why}"
                     )
         print()
 
@@ -2783,7 +2864,7 @@ def _main(argv: list[str], project: Path | None = None) -> int:
     if not args.explain:
         print(style.dim("Run with --explain to see which wheels were rejected and why."))
     if fix_hint:
-        print(style.dim(FIX_HINT))
+        print(style.dim(fix_hint))
     if source_allowed and not args.exit_zero:
         print(style.dim("Source builds are allowed (--fail-on missing), so this run passes."))
     for ln in fix_lines:  # a gap wheel fills only a gap, so the runs that return early above have none
