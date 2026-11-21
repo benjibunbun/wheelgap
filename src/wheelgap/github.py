@@ -175,14 +175,19 @@ _NAME_START_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[Package, Path, int | None]] | None:
-    """Each requirement of a requirements file and the files it includes with -r, as the parser reads them: the
-    package, the file and the line its name is on (None if that isn't clear). None if a file can't be read the
-    same way."""
-    seen = set() if seen is None else seen
+    """Each requirement reached through -r/-c, as the parser reads it: the package, file and the line its name is
+    on (None if that isn't clear). A constraints file's own lines aren't requirements. None if a file can't be
+    read the same way."""
+    return _requirement_lines(path, {False: set() if seen is None else seen, True: set()})
+
+
+def _requirement_lines(
+    path: Path, seen: dict[bool, set[Path]], constraint: bool = False
+) -> list[tuple[Package, Path, int | None]] | None:
     path = path.resolve()
-    if path in seen:
+    if path in seen[constraint]:
         return []
-    seen.add(path)
+    seen[constraint].add(path)
     lines = _lines(path)
     if lines is None or any(_OTHER_BREAKS.search(line) for line in lines):
         return None
@@ -200,17 +205,21 @@ def requirement_lines(path: Path, seen: set[Path] | None = None) -> list[tuple[P
         if not line or line.startswith("#"):
             continue
         if line.startswith("-"):
-            try:  # the -r the parser follows, wherever it sits on the line (`--pre -r base.txt`)
+            try:  # the -r/-c the parser follows, wherever it sits on the line (`--pre -r base.txt`)
                 include = _line_include(shlex.split(line), path.name)
             except (ValueError, SourceError):
                 return None  # the parser refused this file, so there's nothing to map
-            if include and not include[0]:
-                included = requirement_lines(path.parent / include[1], seen)
+            if include:
+                is_constraint, target = include
+                if is_constraint and ("://" in target or "${" in target):
+                    continue  # the parser leaves these constraints unread
+                # -r means requirements even inside a constraints file; track each file in both roles.
+                included = _requirement_lines(path.parent / target, seen, is_constraint)
                 if included is None:
                     return None
                 out.extend(included)
-            continue  # other options, constraints and editables: never a package with a gap
-        if line.startswith(("-", ".", "/")):
+            continue  # other options and editables: never a package with a gap
+        if constraint or line.startswith(("-", ".", "/")):
             continue  # options, constraints, editables and paths: never a package with a gap
         tokens = line.split()
         line = " ".join(

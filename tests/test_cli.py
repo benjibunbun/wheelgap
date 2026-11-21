@@ -3546,6 +3546,92 @@ def test_github_annotations_requirements_include_after_options(capsys, fake_pypi
         assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=2,"]
 
 
+@pytest.mark.parametrize("include", ["-c cons.txt", '--pre --constraint="cons.txt"'])
+def test_github_annotations_requirements_inside_constraints(tmp_path, include):
+    from wheelgap.github import Locator
+    from wheelgap.sources import load_file
+
+    # Both the top-level and nested requirement keep their locations (#614).
+    req = tmp_path / "a.txt"
+    req.write_text(f"requests==2.32.5\n{include}\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r extra.txt\n", encoding="utf-8")
+    extra = tmp_path / "extra.txt"
+    extra.write_text("nowheels==0.9\n", encoding="utf-8")
+    source = load_file(req)
+    locator = Locator([source])
+    assert [(p.name, locator.locate(p)) for p in source.packages] == [
+        ("requests", (req, 1)),
+        ("nowheels", (extra, 1)),
+    ]
+
+
+def test_github_annotations_requirements_nested_constraints(capsys, fake_pypi, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text("ranged==1.9\n-c sub/cons.txt\n", encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "cons.txt").write_text("purewheel==3.1\n-r extra.txt\n", encoding="utf-8")
+    (sub / "extra.txt").write_text("-c deep.txt\nnowheels==0.9\n", encoding="utf-8")
+    (sub / "deep.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    # -c -> -r -> -c: only requirement lines get annotations, never the constraints themselves.
+    assert annotate(capsys, tmp_path, str(req)) == [
+        "::error file=sub/extra.txt,line=2,",
+        "::error file=a.txt,line=1,",
+    ]
+
+
+@pytest.mark.parametrize("includes", ["-c shared.txt\n-r shared.txt\n", "-r shared.txt\n-c shared.txt\n"])
+def test_github_annotations_requirements_both_roles(capsys, fake_pypi, tmp_path, monkeypatch, includes):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text(includes + "-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "shared.txt").write_text("-r extra.txt\nranged==1.9\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    # Reading a file as constraints mustn't hide its own requirements when reached through -r.
+    # The requirement shared by all paths is still read only once.
+    assert annotate(capsys, tmp_path, str(req)) == [
+        "::error file=extra.txt,line=1,",
+        "::error file=shared.txt,line=2,",
+    ]
+
+
+def test_github_annotations_deps_inside_constraints(index, capsys, tmp_path, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text("-c cons.txt\napp==1.0\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("crypt==1.0\n", encoding="utf-8")
+    code, out, _ = run(capsys, str(req), "--deps", "-p", "3.14", "-t", "win-arm64", "--github-annotations")
+    assert code == 1
+    (line,) = [line for line in annotation_lines(out) if "title=crypt" in line]
+    assert line.startswith("::error file=extra.txt,line=1,")
+
+
+@pytest.mark.parametrize("target", ["https://example.invalid/cons.txt", "${CONSTRAINTS}"])
+def test_github_annotations_requirements_unread_constraints(capsys, fake_pypi, tmp_path, monkeypatch, target):
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text(f"-c {target}\nnowheels==0.9\n", encoding="utf-8")
+    # The parser leaves remote/environment-based constraints unread, so the scanner must too.
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=a.txt,line=2,"]
+
+
+@pytest.mark.parametrize("lines", [None, ["purewheel==3.1", "nowheels==0.9"]])
+def test_github_annotations_requirements_constraints_cross_check(capsys, fake_pypi, tmp_path, monkeypatch, lines):
+    from wheelgap import github
+
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "a.txt"
+    req.write_text("ranged==1.9\n-c cons.txt\n", encoding="utf-8")
+    (tmp_path / "cons.txt").write_text("-r extra.txt\n", encoding="utf-8")
+    (tmp_path / "extra.txt").write_text("nowheels==0.9\n", encoding="utf-8")
+    read = github._lines
+    monkeypatch.setattr(github, "_lines", lambda path: lines if path.name == "extra.txt" else read(path))
+    # If a nested file disappears or changes between parsing and locating, neither package gets a line.
+    assert annotate(capsys, tmp_path, str(req)) == ["::error file=a.txt,", "::error file=a.txt,"]
+
+
 def test_github_annotations_requirements_cross_check(capsys, fake_pypi, tmp_path, monkeypatch):
     # The file is read twice; if the scan doesn't find what the parser read (here the file changed in between, so
     # every line moved down), no line is used.
